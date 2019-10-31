@@ -1,0 +1,294 @@
+-- Mandataory command
+ADD JAR /opt/cloudera/parcels/CDH/lib/hive/lib/hive-hcatalog-core-1.1.0-cdh5.11.2.jar;
+
+-- DROPPING ANY EXISTING TABLE
+drop table taxi_data;
+
+-- CREATING EXTERNAL TABLE
+create external table if not exists taxi_data(VendorID int, tpep_pickup_datetime string,
+    tpep_dropoff_datetime string, Passenger_count int, Trip_distance double, PULocationID string, DOLocationID string,
+    RateCodeID int, Store_and_fwd_flag string, Payment_type int, Fare_amount double, Extra double, MTA_tax double,
+    Improvement_surcharge double, Tip_amount double, Tolls_amount double, Total_amount double)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY ','
+location '/common_folder/nyc_taxi_data/'
+TBLPROPERTIES ("skip.header.line.count"="1");
+
+-- Reviewing the data for sanity check.
+select *
+from taxi_data
+limit 10;
+
+---------------------------------------------------------------Basic Data Quality Checks-----------------------------------------------------
+
+--Total records: 1174569
+select count(*)
+from taxi_data;
+
+
+-- No. of recordes provided by each provider
+select VendorID, count(*) as total_records
+from taxi_data
+group by VendorID
+order by total_records;
+
+-- 1: 527386(45%)
+-- 2: 647183(55%)
+
+
+-- Data Consistency check on pickup time
+-------------------------------------------------------------------------------------
+-- To check different months present in the ride data(through distict pickup times)
+select  distinct month(tpep_pickup_datetime)
+from taxi_data limit 10;
+
+--   4 differnt months present : 11, 12, 10, 1
+--   2 inconsistent month - 10, 1
+
+-- No. of records of each month
+select month(tpep_pickup_datetime) as month_no, count(*) as total_record
+from taxi_data
+group by month(tpep_pickup_datetime);
+
+--   12 - 594247(50%)
+--   11 - 580300(49.4)
+--   10 - 6(0.03%)
+--   1  - 6(0.03%)
+-- Total of 12 incosistent records(0.6%) 6 each for the month 10 and 1
+
+-- Check the records that are incosistent for more insight :
+select *
+from taxi_data
+where month(tpep_pickup_datetime) == 1 or month(tpep_pickup_datetime) == 10
+
+-- All the inconsistent data is provided by Vendor with vendorID 2
+
+-- checking if pickup and drop time are same for any ride
+select VendorID, count(*)
+from taxi_data
+where tpep_pickup_datetime == tpep_dropoff_datetime
+group by VendorID;
+
+-- In total of 6482 records have pickup and drop time same
+-- This erronous data is provided by both the vendors almost equally.
+
+---------------------------------------------------------------------------------------
+
+--Analysing Trip distance
+----------------------------------
+-- Checking spread of data
+select min(Trip_distance) as minimum, avg(Trip_distance) as average, max(Trip_distance) as maximum
+from taxi_data;
+
+--  minimum - 0
+--  average - 2.8
+--  maximum - 126.41
+
+-- Checking trip where distance is 0
+select count(*)
+from taxi_data
+where Trip_distance == 0;
+
+-- 7402 records with trip distance = 0;
+--------------------------------------------------------------
+
+-- Analysing Fare
+---------------------------------------------------------------
+-- Checking whether there is a significant inconsistency between individual charges and total fare.
+select count(*)
+from taxi_data
+where int(Fare_amount + Extra + MTA_tax + Improvement_surcharge + Tip_amount +Tolls_amount) != int(Total_amount);
+
+-- In 1712 records( 0.14% ) all charges DO NOT add up to Total Amount.
+
+select  VendorID, count(*) as count
+from taxi_data
+where int(Fare_amount + Extra + MTA_tax + Improvement_surcharge + Tip_amount + Tolls_amount) != int(Total_amount)
+group by VendorID;
+
+--  94% of this data is provided by VENDOR 2
+
+select VendorID, count(*)
+from taxi_data
+where Total_amount == 0
+group by VendorID;
+
+-- Total 123 records of trip where trip distance is 0
+-- 66% of this data is provided by Vendor 2
+--------------------------------------------------------------------
+
+-- Analysing No. of passengers
+--------------------------------------------------------------------
+
+-- checking for unusual count of passengers:
+select VendorID, count(*)
+from taxi_data
+where Passenger_count == 0
+group by VendorID;
+
+-- Total of 6824(0.5%) records where passenger count is 0
+-- 99% of which is provided by Vendor 1
+
+------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Removing erronous data:
+---------------------------------------------
+
+drop table taxi_data_new;
+
+create external table if not exists taxi_data_new(VendorID int, tpep_pickup_datetime string,
+    tpep_dropoff_datetime string, Passenger_count int, Trip_distance double, PULocationID string, DOLocationID string,
+    RateCodeID int, Store_and_fwd_flag string, Payment_type int, Fare_amount double, Extra double, MTA_tax double,
+    Improvement_surcharge double, Tip_amount double, Tolls_amount double, Total_amount double);
+
+insert overwrite table taxi_data_new
+select * from taxi_data
+where month(tpep_pickup_datetime) in(11,12) and
+       Trip_distance != 0 and
+       int(Fare_amount + Extra + MTA_tax + Improvement_surcharge + Tip_amount +Tolls_amount) == int(Total_amount) and
+       Passenger_count != 0 and
+       Total_amount != 0 and
+       tpep_pickup_datetime != tpep_dropoff_datetime
+;
+----------------------------------------------------------------
+
+-- Creating ORC_Partioned Table
+
+SET hive.exec.max.dynamic.partitions=100000;
+SET hive.exec.max.dynamic.partitions.pernode=100000;
+
+drop table taxi_data_partioned;
+
+create external table if not exists taxi_data_partioned
+    (VendorID int, tpep_pickup_datetime string,
+    tpep_dropoff_datetime string, Passenger_count int, Trip_distance double, PULocationID string, DOLocationID string,
+    RateCodeID int, Store_and_fwd_flag string, Payment_type int, Fare_amount double, Extra double, MTA_tax double,
+    Improvement_surcharge double, Tip_amount double, Tolls_amount double, Total_amount double) partitioned by (mnth int, dd int)
+    location '/user/hive/warehouse/adarsh/assignment/taxi_data_partioned';  
+    
+insert overwrite table taxi_data_partioned partition(mnth, dd)
+select VendorID, tpep_pickup_datetime, tpep_dropoff_datetime, Passenger_count, Trip_distance, PULocationID,
+        DOLocationID, RateCodeID, Store_and_fwd_flag, Payment_type, Fare_amount, Extra,
+        MTA_tax, Improvement_surcharge, Tip_amount, Tolls_amount, Total_amount, month(tpep_pickup_datetime) as mnth, dayofmonth(tpep_pickup_datetime) as dd
+from taxi_data_new;
+
+drop table taxi_data_partioned_orc;
+
+create external table if not exists taxi_data_partioned_orc
+    (VendorID int, tpep_pickup_datetime string,
+    tpep_dropoff_datetime string, Passenger_count int, Trip_distance double, PULocationID string, DOLocationID string,
+    RateCodeID int, Store_and_fwd_flag string, Payment_type int, Fare_amount double, Extra double, MTA_tax double,
+    Improvement_surcharge double, Tip_amount double, Tolls_amount double, Total_amount double)
+partitioned by (mnth int, dd int)
+stored as orc location '/user/hive/warehouse/adarsh/assignment/taxi_data_partioned'
+tblproperties ("orc.compress"="SNAPPY");
+
+insert overwrite table taxi_data_partioned_orc partition(mnth, dd)
+select * from taxi_data_partioned;
+
+---------------------------------------------------------------------Analysis 1---------------------------------------------------------------------------------
+-- 1. 
+-- Average fare for month of november : $16.37
+select avg(Total_amount)
+from taxi_data_partioned_orc
+where mnth = 11;
+
+-- Average fare for month of december : $16.07
+select avg(Total_amount)
+from taxi_data_partioned_orc
+where mnth = 12;
+
+--  Avergare fair more in november but mostly similar for both the months
+-------------------------------------------------
+
+-- 2.
+Select Passenger_count, count(*) as No_of_trips
+from taxi_data_partioned_orc
+group by Passenger_count
+order by No_of_trips;
+
+-- Most number of trips are carried out by solo passengers 
+-----------------------------------------------------
+
+-- 3.
+select Payment_type, count(*) as trips
+from taxi_data_partioned_orc
+group by Payment_type
+order by trips desc;
+
+-- Most common payment mode is Credit card followed by cash
+--------------------------------------------------------
+
+-- 4. 
+--Average tip per trip : $0.32
+select avg(Tip_amount)
+from taxi_data_partioned_orc;
+
+select percentile_approx(Tip_amount, 0.25) as 25th, percentile_approx( Tip_amount,0.5 ) as 50th, percentile_approx(Tip_amount,0.90 ) as 90th
+from taxi_data_partioned_orc;
+---------------------------------------------------------
+-- 5.
+
+select count(*) from  taxi_data_partioned_orc;
+
+select count (*)
+from taxi_data_partioned_orc
+where Extra != 0;
+
+-- 46% of the fares have levied extra charge.
+--------------------------------------------------------
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+-------------------------------------------------------Analysis 2--------------------------------------------------------------------------------------------
+
+-- 1.
+select corr(Passenger_count, Tip_amount)
+from taxi_data_partioned_orc;
+
+-- Passenger count has a  correlation with tip.
+
+--3. 
+-- avergae speed in month of november: 4.83 m/s or 15.48 km/hour
+select avg(
+            (Trip_distance* 1609) / 
+            (
+                    ((hour(tpep_dropoff_datetime)*3600) + (minute(tpep_dropoff_datetime)*60) + second(tpep_dropoff_datetime)) -
+                    ((hour(tpep_pickup_datetime)*3600) + (minute(tpep_pickup_datetime)*60) + second(tpep_pickup_datetime))
+            )
+        )
+from taxi_data_partioned_orc
+where mnth = 11;
+
+-- -- avergae speed in month of december: 4.83 m/s or 17.3 km/hour
+select avg(
+            (Trip_distance* 1609) / 
+            (
+                    ((hour(tpep_dropoff_datetime)*3600) + (minute(tpep_dropoff_datetime)*60) + second(tpep_dropoff_datetime)) -
+                    ((hour(tpep_pickup_datetime)*3600) + (minute(tpep_pickup_datetime)*60) + second(tpep_pickup_datetime))
+            )
+        )
+from taxi_data_partioned_orc
+where mnth = 12;
+
+--- average speed on 31st december : 5.87 m/s or 21 km/hr
+select avg(
+            (Trip_distance* 1609) / 
+            (
+                    ((hour(tpep_dropoff_datetime)*3600) + (minute(tpep_dropoff_datetime)*60) + second(tpep_dropoff_datetime)) -
+                    ((hour(tpep_pickup_datetime)*3600) + (minute(tpep_pickup_datetime)*60) + second(tpep_pickup_datetime))
+            )
+        )
+from taxi_data_partioned_orc
+where mnth = 12 and dd = 31;
+
+--- average speed on 25th december : 6.72 m/s or 24.2 km/hr
+select avg(
+            (Trip_distance* 1609) / 
+            (
+                    ((hour(tpep_dropoff_datetime)*3600) + (minute(tpep_dropoff_datetime)*60) + second(tpep_dropoff_datetime)) -
+                    ((hour(tpep_pickup_datetime)*3600) + (minute(tpep_pickup_datetime)*60) + second(tpep_pickup_datetime))
+            )
+        )
+from taxi_data_partioned_orc
+where mnth = 12 and dd = 25;
